@@ -5,14 +5,22 @@ Saves plots to PNGs instead of showing interactive windows.
 """
 
 from pathlib import Path
+from itertools import cycle
 import pandas as pd
 import numpy as np
 import warnings
 
 try:
     import umap
-except ImportError:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover - optional dependency/runtime issues
     umap = None
+
+try:
+    import plotly.express as px
+    from plotly import graph_objects as go
+except Exception:  # pragma: no cover - optional dependency/runtime issues
+    px = None
+    go = None
 
 # --- make matplotlib non-interactive & fast ---
 import matplotlib
@@ -171,6 +179,263 @@ def _tsne_numpy(
             P /= early_exaggeration
 
     return Y
+
+
+def _save_interactive_scatter(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    plot_path: Path,
+    *,
+    title: str,
+    color_col: str = "cluster_label",
+) -> None:
+    """Persist Plotly scatter with hover metadata when plotly is available."""
+    if px is None:
+        print(f"[WARN] Plotly not installed; skipping interactive plot '{plot_path.name}'.")
+        return
+
+    hover_data = {
+        "pdb_id": True,
+        "symbol": True,
+        "receptor_class": True,
+        "subfamily": True,
+        "resolution": ":.2f",
+        "cluster_label": True,
+        "mean_bfactor": ":.2f",
+        "std_bfactor": ":.2f",
+    }
+
+    fig = px.scatter(
+        df,
+        x=x_col,
+        y=y_col,
+        color=color_col,
+        hover_name="pdb_id",
+        hover_data=hover_data,
+        title=title,
+        width=900,
+        height=700,
+    )
+    fig.update_traces(marker=dict(size=10, opacity=0.85, line=dict(width=0.05, color="#333333")))
+    fig.update_layout(legend_title_text="Cluster", template="plotly_white")
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(plot_path))
+    print(f"Saved interactive scatter → {plot_path}")
+
+
+def _save_symbol_cluster_toggle_scatter(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    plot_path: Path,
+    *,
+    title: str,
+    class_col: str = "receptor_class",
+) -> None:
+    """Interactive scatter with receptor legend + buttons for coloring and class filters."""
+    if px is None or go is None:
+        print(f"[WARN] Plotly not installed; skipping interactive plot '{plot_path.name}'.")
+        return
+
+    if df.empty:
+        print(f"[WARN] No data for interactive plot '{plot_path.name}'.")
+        return
+
+    df = df.copy()
+    df = df.dropna(subset=[x_col, y_col, "symbol", "cluster_label"])
+    if df.empty:
+        print(f"[WARN] Missing coordinates or annotations for '{plot_path.name}'.")
+        return
+
+    if class_col not in df.columns:
+        df[class_col] = DEFAULT_RECEPTOR_CLASS
+    df[class_col] = df[class_col].fillna(DEFAULT_RECEPTOR_CLASS)
+
+    symbol_palette = (
+        px.colors.qualitative.Safe
+        + px.colors.qualitative.Set3
+        + px.colors.qualitative.Pastel
+        + px.colors.qualitative.Bold
+    )
+    cluster_palette = (
+        px.colors.qualitative.Plotly
+        + px.colors.qualitative.D3
+        + px.colors.qualitative.Dark24
+    )
+
+    symbol_cycle = cycle(symbol_palette)
+    cluster_cycle = cycle(cluster_palette)
+    symbol_colors: dict[str, str] = {}
+    cluster_colors: dict[str, str] = {}
+
+    symbols = sorted(df["symbol"].dropna().unique())
+    clusters = sorted(df["cluster_label"].dropna().unique())
+
+    for sym in symbols:
+        symbol_colors[sym] = next(symbol_cycle)
+    for cid in clusters:
+        cluster_colors[cid] = next(cluster_cycle)
+
+    fig = go.Figure()
+    hover_template = (
+        "PDB: %{customdata[0]}<br>"
+        "Receptor: %{customdata[1]}<br>"
+        "Class: %{customdata[2]}<br>"
+        "Cluster: %{customdata[3]}<br>"
+        "Resolution: %{customdata[4]:.2f} Å<br>"
+        "Mean B: %{customdata[5]:.2f}<br>"
+        "Std B: %{customdata[6]:.2f}<extra></extra>"
+    )
+
+    receptor_color_arrays: list[list[str]] = []
+    cluster_color_arrays: list[list[str]] = []
+    trace_classes: list[str] = []
+
+    for sym in symbols:
+        sub = df[df["symbol"] == sym]
+        if sub.empty:
+            continue
+        receptor_class = sub[class_col].iloc[0]
+        trace_classes.append(receptor_class)
+        receptor_color_list = [symbol_colors[sym]] * len(sub)
+        cluster_color_list = [cluster_colors[c] for c in sub["cluster_label"]]
+        receptor_color_arrays.append(receptor_color_list)
+        cluster_color_arrays.append(cluster_color_list)
+        customdata = np.column_stack(
+            [
+                sub["pdb_id"].astype(str),
+                sub["symbol"].astype(str),
+                sub[class_col].astype(str),
+                sub["cluster_label"].astype(str),
+                sub["resolution"].astype(float),
+                sub["mean_bfactor"].astype(float),
+                sub["std_bfactor"].astype(float),
+            ]
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sub[x_col],
+                y=sub[y_col],
+                mode="markers",
+                name=sym,
+                legendgroup=sym,
+                marker=dict(
+                    color=receptor_color_list,
+                    size=10,
+                    opacity=0.85,
+                    line=dict(width=0.4, color="#222222"),
+                ),
+                customdata=customdata,
+                hovertemplate=hover_template,
+                visible=True,
+            )
+        )
+
+    if not fig.data:
+        print(f"[WARN] No traces generated for '{plot_path.name}'.")
+        return
+
+    receptor_button = dict(
+        label="Color by receptor",
+        method="restyle",
+        args=[{"marker.color": receptor_color_arrays}],
+    )
+    cluster_button = dict(
+        label="Color by cluster",
+        method="restyle",
+        args=[{"marker.color": cluster_color_arrays}],
+    )
+
+    class_masks = {}
+    total_traces = len(fig.data)
+    class_masks["All"] = [True] * total_traces
+    unique_classes = [cls for cls in RECEPTOR_CLASS_ORDER if cls != "All"]
+    for cls in unique_classes:
+        mask = [trace_cls == cls for trace_cls in trace_classes]
+        class_masks[cls] = mask
+
+    class_buttons = []
+    for cls in RECEPTOR_CLASS_ORDER:
+        if cls == "All":
+            mask = class_masks["All"]
+        else:
+            mask = class_masks.get(cls)
+            if mask is None:
+                continue
+        class_buttons.append(
+            dict(
+                label=cls,
+                method="update",
+                args=[{"visible": mask}],
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        width=1000,
+        height=720,
+        template="plotly_white",
+        legend_title_text="Receptor",
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="right",
+                buttons=[receptor_button, cluster_button],
+                x=1.18,
+                xanchor="left",
+                y=1.08,
+                yanchor="top",
+                pad={"r": 10, "t": 10},
+                showactive=True,
+            ),
+            dict(
+                type="buttons",
+                direction="down",
+                buttons=class_buttons,
+                x=1.18,
+                xanchor="left",
+                y=0.82,
+                pad={"r": 8, "t": 5},
+                showactive=True,
+            ),
+        ],
+        margin=dict(l=60, r=10, t=90, b=60),
+        xaxis_title=x_col,
+        yaxis_title=y_col,
+    )
+
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(plot_path))
+    print(f"Saved interactive scatter → {plot_path}")
+
+
+RECEPTOR_CLASS_MAP = {
+    "NR3A": "Steroid (classic endocrine)",
+    "NR3B": "Steroid (classic endocrine)",
+    "NR3C": "Steroid (classic endocrine)",
+    "NR1A": "Non-steroid endocrine",
+    "NR1B": "Non-steroid endocrine",
+    "NR5A": "Non-steroid endocrine",
+    "NR1C": "Metabolic/xeno-sensors",
+    "NR1H": "Metabolic/xeno-sensors",
+    "NR1I": "Metabolic/xeno-sensors",
+    "NR1D": "Circadian/immune modulators",
+    "NR1F": "Circadian/immune modulators",
+    "NR2F": "Circadian/immune modulators",
+    "NR4A": "Circadian/immune modulators",
+}
+DEFAULT_RECEPTOR_CLASS = "Orphans"
+RECEPTOR_CLASS_ORDER = [
+    "All",
+    "Steroid (classic endocrine)",
+    "Non-steroid endocrine",
+    "Metabolic/xeno-sensors",
+    "Circadian/immune modulators",
+    "Orphans",
+]
+
+
 # Paths
 meta_path = Path("data/meta/structures.csv")
 bf_path   = Path("data/processed/ca_bfactors.csv")
@@ -479,6 +744,11 @@ structure_stats = (
       .reset_index()
       .merge(meta[["pdb_id", "resolution"]], on="pdb_id", how="left")
 )
+structure_stats["receptor_class"] = (
+    structure_stats["subfamily"]
+    .map(RECEPTOR_CLASS_MAP)
+    .fillna(DEFAULT_RECEPTOR_CLASS)
+)
 
 feature_cols = [
     "mean_bfactor",
@@ -545,6 +815,22 @@ else:
         tsne_plot_path = plot_dir / "tsne_kmeans_bfactor_clusters.png"
         plt.savefig(tsne_plot_path, dpi=300)
         plt.close()
+        tsne_html_path = plot_dir / "tsne_kmeans_bfactor_clusters.html"
+        _save_interactive_scatter(
+            structure_stats,
+            "tsne_1",
+            "tsne_2",
+            tsne_html_path,
+            title="Per-structure Cα B-factor profiles (t-SNE, interactive)",
+        )
+        tsne_symbol_html = plot_dir / "tsne_kmeans_receptors.html"
+        _save_symbol_cluster_toggle_scatter(
+            structure_stats,
+            "tsne_1",
+            "tsne_2",
+            tsne_symbol_html,
+            title="Per-structure Cα B-factor profiles (t-SNE, receptor legend)",
+        )
 
     if umap is None:
         print("\numap-learn not installed; skipping UMAP visualization.")
@@ -585,6 +871,22 @@ else:
             umap_plot_path = plot_dir / "umap_kmeans_bfactor_clusters.png"
             plt.savefig(umap_plot_path, dpi=300)
             plt.close()
+            umap_html_path = plot_dir / "umap_kmeans_bfactor_clusters.html"
+            _save_interactive_scatter(
+                structure_stats,
+                "umap_1",
+                "umap_2",
+                umap_html_path,
+                title="Per-structure Cα B-factor profiles (UMAP, interactive)",
+            )
+            umap_symbol_html = plot_dir / "umap_kmeans_receptors.html"
+            _save_symbol_cluster_toggle_scatter(
+                structure_stats,
+                "umap_1",
+                "umap_2",
+                umap_symbol_html,
+                title="Per-structure Cα B-factor profiles (UMAP, receptor legend)",
+            )
 
     cluster_out = Path("data/meta/bfactor_clusters_tsne.csv")
     structure_stats.to_csv(cluster_out, index=False)
