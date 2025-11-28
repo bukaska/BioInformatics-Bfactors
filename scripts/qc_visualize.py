@@ -36,6 +36,8 @@ covered = set(meta["uniprot"])
 proteins["has_structure"] = proteins["uniprot"].isin(covered)
 
 missing_proteins = proteins[~proteins["has_structure"]]
+missing_proteins.to_csv("data/meta/missing_receptors.csv", index=False)
+
 
 print("\nProteins with no structures:")
 print(missing_proteins)
