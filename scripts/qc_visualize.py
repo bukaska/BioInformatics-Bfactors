@@ -9,6 +9,11 @@ import pandas as pd
 import numpy as np
 import warnings
 
+try:
+    import umap
+except ImportError:  # pragma: no cover - optional dependency
+    umap = None
+
 # --- make matplotlib non-interactive & fast ---
 import matplotlib
 matplotlib.use("Agg")           # render to files, not GUI
@@ -19,6 +24,153 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 
+
+def _standardize_matrix(df: pd.DataFrame, cols: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return z-scored numpy matrix plus mean/std for reference."""
+    matrix = df[cols].to_numpy(dtype=float)
+    mean = matrix.mean(axis=0, keepdims=True)
+    std = matrix.std(axis=0, keepdims=True)
+    std[std == 0] = 1.0
+    return (matrix - mean) / std, mean, std
+
+
+def _kmeans_numpy(
+    X: np.ndarray,
+    n_clusters: int,
+    *,
+    n_init: int = 10,
+    max_iter: int = 300,
+    tol: float = 1e-4,
+    random_state: int = 42,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Minimal K-means implementation that avoids sklearn dependency."""
+    rng = np.random.default_rng(random_state)
+    best_inertia = np.inf
+    best_labels = None
+    best_centers = None
+
+    for init in range(n_init):
+        if len(X) <= n_clusters:
+            centers = X.copy()
+        else:
+            seed_idx = rng.choice(len(X), n_clusters, replace=False)
+            centers = X[seed_idx].copy()
+
+        for _ in range(max_iter):
+            dists = np.linalg.norm(X[:, None, :] - centers[None, :, :], axis=2)
+            labels = dists.argmin(axis=1)
+
+            new_centers = centers.copy()
+            for cid in range(n_clusters):
+                members = X[labels == cid]
+                if len(members) == 0:
+                    new_centers[cid] = X[rng.integers(len(X))]
+                else:
+                    new_centers[cid] = members.mean(axis=0)
+
+            shift = np.linalg.norm(new_centers - centers)
+            centers = new_centers
+            if shift <= tol:
+                break
+
+        inertia = np.sum((X - centers[labels]) ** 2)
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels.copy()
+            best_centers = centers.copy()
+
+    return best_labels, best_centers, best_inertia
+
+
+def _pairwise_distances(X: np.ndarray) -> np.ndarray:
+    sum_X = np.sum(np.square(X), axis=1)
+    D = sum_X[:, None] + sum_X[None, :] - 2 * X @ X.T
+    np.fill_diagonal(D, 0.0)
+    D = np.maximum(D, 0.0)
+    return D
+
+
+def _hbeta(dist_row: np.ndarray, beta: float) -> tuple[float, np.ndarray]:
+    P = np.exp(-dist_row * beta)
+    sumP = np.maximum(np.sum(P), 1e-12)
+    H = np.log(sumP) + beta * np.sum(dist_row * P) / sumP
+    return H, P / sumP
+
+
+def _tsne_numpy(
+    X: np.ndarray,
+    *,
+    perplexity: float = 30.0,
+    n_components: int = 2,
+    n_iter: int = 1000,
+    learning_rate: float = 200.0,
+    early_exaggeration: float = 4.0,
+    random_state: int = 42,
+) -> np.ndarray:
+    """Small t-SNE implementation (exact algorithm, no Barnes-Hut)."""
+    n_samples = X.shape[0]
+    if n_samples < 2:
+        raise ValueError("t-SNE requires at least two samples.")
+
+    distances = _pairwise_distances(X)
+    P = np.zeros_like(distances)
+    log_perp = np.log(perplexity)
+
+    for i in range(n_samples):
+        mask = np.ones(n_samples, dtype=bool)
+        mask[i] = False
+        beta = 1.0
+        betamin, betamax = -np.inf, np.inf
+        Di = distances[i, mask]
+
+        for _ in range(50):
+            H, thisP = _hbeta(Di, beta)
+            Hdiff = H - log_perp
+            if np.abs(Hdiff) < 1e-5:
+                break
+            if Hdiff > 0:
+                betamin = beta
+                beta = beta * 2 if betamax == np.inf else (beta + betamax) / 2
+            else:
+                betamax = beta
+                beta = beta / 2 if betamin == -np.inf else (beta + betamin) / 2
+
+        P[i, mask] = thisP
+
+    P = (P + P.T)
+    P /= np.sum(P)
+    P = np.maximum(P, 1e-12)
+    P *= early_exaggeration
+
+    rng = np.random.default_rng(random_state)
+    Y = rng.normal(0.0, 1e-4, size=(n_samples, n_components))
+    gains = np.ones_like(Y)
+    y_inertia = np.zeros_like(Y)
+
+    for iteration in range(n_iter):
+        sum_Y = np.sum(np.square(Y), axis=1)
+        num = 1 / (1 + sum_Y[:, None] + sum_Y[None, :] - 2 * Y @ Y.T)
+        np.fill_diagonal(num, 0.0)
+        Q = num / np.sum(num)
+        Q = np.maximum(Q, 1e-12)
+
+        PQ = (P - Q) * num
+        dY = 4 * np.sum(PQ[:, :, None] * (Y[:, None, :] - Y[None, :, :]), axis=1)
+
+        momentum = 0.5 if iteration < 250 else 0.8
+        gains = (gains + 0.2) * (np.sign(dY) != np.sign(y_inertia)) + (gains * 0.8) * (
+            np.sign(dY) == np.sign(y_inertia)
+        )
+        gains[gains < 0.01] = 0.01
+
+        y_inertia = momentum * y_inertia - learning_rate * (gains * dY)
+        Y += y_inertia
+        Y -= Y.mean(axis=0, keepdims=True)
+
+        if iteration == 250:
+            P /= early_exaggeration
+
+    return Y
 # Paths
 meta_path = Path("data/meta/structures.csv")
 bf_path   = Path("data/processed/ca_bfactors.csv")
@@ -117,9 +269,8 @@ x = np.array([merged["resolution"].min(), merged["resolution"].max()])
 plt.plot(x, a*x + b, color="red", linestyle="--", label=f"y={a:.1f}x+{b:.1f}")
 plt.legend()
 
-df = pd.read_csv("data/meta/structure_summary.csv")
-df.dropna(subset=["mean", "resolution"], inplace=True)
-corr = df["resolution"].corr(df["mean"])
+merged_clean = merged.dropna(subset=["resolution", "bfactor"])
+corr = merged_clean["resolution"].corr(merged_clean["bfactor"])
 print(f"\nCorrelation between resolution and mean B-factor: {corr:.3f}")
 
 
@@ -294,8 +445,6 @@ plt.close()
 def _safe_corr(g):
     g = g.dropna(subset=["resolution","mean_norm"])
     return g["resolution"].corr(g["mean_norm"]) if len(g) > 2 else np.nan
-
-
 corr_per_receptor_norm = (summary_norm.groupby("symbol", group_keys=False)
                           .apply(_safe_corr)
                           .reset_index(name="correlation_norm"))
@@ -309,3 +458,141 @@ corr_per_subfam_norm = (summary_norm.groupby("subfamily", group_keys=False)
                         .reset_index(name="correlation_norm"))
 corr_per_subfam_norm.to_csv("data/meta/correlation_per_subfamily_NORMALIZED.csv", index=False)
 print("Saved: correlation_per_subfamily_NORMALIZED.csv")
+
+# ============================
+# K-means clustering + t-SNE visualization (per structure)
+# ============================
+
+structure_stats = (
+    bf.groupby("pdb_id")
+      .agg(
+          mean_bfactor=("bfactor", "mean"),
+          std_bfactor=("bfactor", "std"),
+          median_bfactor=("bfactor", "median"),
+          min_bfactor=("bfactor", "min"),
+          max_bfactor=("bfactor", "max"),
+          q25=("bfactor", lambda s: s.quantile(0.25)),
+          q75=("bfactor", lambda s: s.quantile(0.75)),
+          residue_count=("bfactor", "count"),
+          symbol=("symbol", "first"),
+          subfamily=("subfamily", "first"),
+          uniprot=("uniprot", "first"),
+      )
+      .reset_index()
+      .merge(meta[["pdb_id", "resolution"]], on="pdb_id", how="left")
+)
+
+feature_cols = [
+    "mean_bfactor",
+    "std_bfactor",
+    "median_bfactor",
+    "min_bfactor",
+    "max_bfactor",
+    "q25",
+    "q75",
+    "residue_count",
+]
+
+structure_stats[feature_cols] = structure_stats[feature_cols].fillna(0.0)
+
+if len(structure_stats) < 2:
+    print("\nNot enough structures for clustering; skipping K-means/t-SNE analysis.")
+else:
+    X_scaled, _, _ = _standardize_matrix(structure_stats, feature_cols)
+
+    desired_clusters = 5
+    best_k = min(desired_clusters, len(structure_stats))
+
+    labels, centers, inertia = _kmeans_numpy(
+        X_scaled,
+        n_clusters=best_k,
+        n_init=25,
+        random_state=42,
+    )
+    structure_stats["cluster_id"] = labels
+    structure_stats["cluster_label"] = structure_stats["cluster_id"].apply(lambda cid: f"C{cid + 1}")
+
+    if len(structure_stats) < 3:
+        print("\nNot enough structures for t-SNE projection; saved clusters without embedding.")
+    else:
+        perplexity = min(30, len(structure_stats) - 1)
+        perplexity = max(2, perplexity)
+
+        tsne_coords = _tsne_numpy(
+            X_scaled,
+            perplexity=perplexity,
+            random_state=42,
+        )
+
+        structure_stats["tsne_1"] = tsne_coords[:, 0]
+        structure_stats["tsne_2"] = tsne_coords[:, 1]
+
+        plt.figure(figsize=(9, 7))
+        cluster_cmap = plt.cm.get_cmap("tab10", best_k)
+        for idx, (cid, cluster_df) in enumerate(structure_stats.groupby("cluster_label")):
+            plt.scatter(
+                cluster_df["tsne_1"],
+                cluster_df["tsne_2"],
+                color=cluster_cmap(idx),
+                alpha=0.7,
+                label=cid,
+                s=25,
+            )
+
+        plt.xlabel("t-SNE 1")
+        plt.ylabel("t-SNE 2")
+        plt.title("Per-structure Cα B-factor profiles colored by K-means cluster")
+        plt.legend(title="Cluster", bbox_to_anchor=(1.02, 1), loc="upper left")
+        plt.tight_layout()
+        tsne_plot_path = plot_dir / "tsne_kmeans_bfactor_clusters.png"
+        plt.savefig(tsne_plot_path, dpi=300)
+        plt.close()
+
+    if umap is None:
+        print("\numap-learn not installed; skipping UMAP visualization.")
+    else:
+        if len(structure_stats) < 3:
+            print("\nNot enough structures for UMAP projection; skipping UMAP plot.")
+        else:
+            n_neighbors = min(15, len(structure_stats) - 1)
+            n_neighbors = max(2, n_neighbors)
+            reducer = umap.UMAP(
+                n_neighbors=n_neighbors,
+                min_dist=0.15,
+                n_components=2,
+                metric="euclidean",
+                random_state=42,
+            )
+            umap_coords = reducer.fit_transform(X_scaled)
+            structure_stats["umap_1"] = umap_coords[:, 0]
+            structure_stats["umap_2"] = umap_coords[:, 1]
+
+            plt.figure(figsize=(9, 7))
+            cluster_cmap = plt.cm.get_cmap("tab10", best_k)
+            for idx, (cid, cluster_df) in enumerate(structure_stats.groupby("cluster_label")):
+                plt.scatter(
+                    cluster_df["umap_1"],
+                    cluster_df["umap_2"],
+                    color=cluster_cmap(idx),
+                    alpha=0.7,
+                    label=cid,
+                    s=25,
+                )
+
+            plt.xlabel("UMAP 1")
+            plt.ylabel("UMAP 2")
+            plt.title("Per-structure Cα B-factor profiles colored by K-means cluster (UMAP)")
+            plt.legend(title="Cluster", bbox_to_anchor=(1.02, 1), loc="upper left")
+            plt.tight_layout()
+            umap_plot_path = plot_dir / "umap_kmeans_bfactor_clusters.png"
+            plt.savefig(umap_plot_path, dpi=300)
+            plt.close()
+
+    cluster_out = Path("data/meta/bfactor_clusters_tsne.csv")
+    structure_stats.to_csv(cluster_out, index=False)
+
+    print(f"\nSaved per-structure K-means clusters → {cluster_out}")
+    if "tsne_plot_path" in locals():
+        print("Saved t-SNE plot →", tsne_plot_path)
+    if "umap_plot_path" in locals():
+        print("Saved UMAP plot →", umap_plot_path)
